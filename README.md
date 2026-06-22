@@ -32,3 +32,5 @@ Show app logs:
 ```bash
 adb logcat -s "NativeExample"
 ```
+
+Extract wgpu to jni/wgpu: https://github.https://github.com/gfx-rs/wgpu-native/releases/download/v29.0.0.0/wgpu-android-aarch64-release.zip

@@ -1,327 +1,298 @@
-#include <jni.h>
-
-#include <EGL/egl.h>
-#include <GLES2/gl2.h>
-
+#include <webgpu/webgpu.h>
+#include <webgpu/wgpu.h>
+#include <android/native_activity.h>
 #include <android/log.h>
-#include <android/asset_manager.h>
-#include <android_native_app_glue.h>
-
+#include <android/native_window.h>
+#include <jni.h>
+#include <assert.h>
+#include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 
-#define LOG(...) ((void)__android_log_print(ANDROID_LOG_INFO, "NativeExample", __VA_ARGS__))
+#define TAG "NativeExample"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-struct engine
-{
-    struct android_app* app;
+typedef struct {
+  ANativeActivity     *activity;
+  ANativeWindow       *window;
+  bool                 running;
 
-    int active;
-    EGLDisplay display;
-    EGLSurface surface;
-    EGLContext context;
-    int32_t width;
-    int32_t height;
+  WGPUInstance         instance;
+  WGPUSurface          surface;
+  WGPUAdapter          adapter;
+  WGPUDevice           device;
+  WGPUQueue            queue;
+  WGPURenderPipeline   pipeline;
+  WGPUSurfaceConfiguration config;
+} AppState;
 
-    GLuint buffer;
-    GLuint shader;
-};
+// ─── wgpu callbacks ────────────────────────────────────────────────────────
 
-static int engine_init_display(struct engine* engine)
-{
-    const EGLint attribs[] =
-    {
-        EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
-        EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
-        EGL_BLUE_SIZE, 8,
-        EGL_GREEN_SIZE, 8,
-        EGL_RED_SIZE, 8,
-        EGL_NONE,
-    };
-
-    EGLDisplay display;;
-    if ((display = eglGetDisplay(EGL_DEFAULT_DISPLAY)) == EGL_NO_DISPLAY)
-    {
-        LOG("error with eglGetDisplay");
-        return -1;
-    }
-
-    if (!eglInitialize(display, 0, 0))
-    {
-        LOG("error with eglInitialize");
-        return -1;
-    }
-
-    EGLConfig config;
-    EGLint numConfigs;
-    if (!eglChooseConfig(display, attribs, &config, 1, &numConfigs))
-    {
-        LOG("error with eglChooseConfig");
-        return -1;
-    }
-
-    EGLint format;
-    if (!eglGetConfigAttrib(display, config, EGL_NATIVE_VISUAL_ID, &format))
-    {
-        LOG("error with eglGetConfigAttrib");
-        return -1;
-    }
-
-    ANativeWindow_setBuffersGeometry(engine->app->window, 0, 0, format);
-
-    EGLSurface surface;
-    if (!(surface = eglCreateWindowSurface(display, config, engine->app->window, NULL)))
-    {
-        LOG("error with eglCreateWindowSurface");
-        return -1;
-    }
-
-    const EGLint ctx_attrib[] = { EGL_CONTEXT_CLIENT_VERSION, 2, EGL_NONE };
-    EGLContext context;
-    if (!(context = eglCreateContext(display, config, NULL, ctx_attrib)))
-    {
-        LOG("error with eglCreateContext");
-        return -1;
-    }
-
-    if (eglMakeCurrent(display, surface, surface, context) == EGL_FALSE)
-    {
-        LOG("error with eglMakeCurrent");
-        return -1;
-    }
-
-    LOG("GL_VENDOR = %s", glGetString(GL_VENDOR));
-    LOG("GL_RENDERER = %s", glGetString(GL_RENDERER));
-    LOG("GL_VERSION = %s", glGetString(GL_VERSION));
-    ARect rect = engine->app->contentRect;
-    LOG("contentRect = (%d, %d, %d, %d)", rect.left, rect.top, rect.right, rect.bottom);
-
-    EGLint w, h;
-    eglQuerySurface(display, surface, EGL_WIDTH, &w);
-    eglQuerySurface(display, surface, EGL_HEIGHT, &h);
-
-    LOG("surface = (%d, %d)", w, h);
-
-    engine->display = display;
-    engine->context = context;
-    engine->surface = surface;
-    engine->width = w;
-    engine->height = h;
-
-    AAsset* vasset = AAssetManager_open(engine->app->activity->assetManager, "vertex.glsl", AASSET_MODE_BUFFER);
-    if (!vasset)
-    {
-        LOG("error opening vertex.glsl");
-        return -1;
-    }
-    const GLchar* vsrc = AAsset_getBuffer(vasset);
-    GLint vlen = AAsset_getLength(vasset);
-
-    GLuint v = glCreateShader(GL_VERTEX_SHADER);
-    glShaderSource(v, 1, &vsrc, &vlen);
-    glCompileShader(v);
-
-    AAsset_close(vasset);
-
-    AAsset* fasset = AAssetManager_open(engine->app->activity->assetManager, "fragment.glsl", AASSET_MODE_BUFFER);
-    if (!fasset)
-    {
-        LOG("error opening fragment.glsl");
-        return -1;
-    }
-    const GLchar* fsrc = AAsset_getBuffer(fasset);
-    GLint flen = AAsset_getLength(fasset);
-
-    GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
-    glShaderSource(f, 1, &fsrc, &flen);
-    glCompileShader(f);
-
-    AAsset_close(fasset);
-
-    GLuint p = glCreateProgram();
-    glAttachShader(p, v);
-    glAttachShader(p, f);
-
-    glBindAttribLocation(p, 0, "vPosition");
-    glBindAttribLocation(p, 1, "vColor");
-    glLinkProgram(p);
-
-    glDeleteShader(v);
-    glDeleteShader(f);
-    glUseProgram(p);
-
-    const float buf[] =
-    {
-         0.0f,  0.5f, 1.f, 0.f, 0.f,
-        -0.5f, -0.5f, 0.f, 1.f, 0.f,
-         0.5f, -0.5f, 0.f, 0.f, 1.f,
-    };
-
-    GLuint b;
-    glGenBuffers(1, &b);
-    glBindBuffer(GL_ARRAY_BUFFER, b);
-    glBufferData(GL_ARRAY_BUFFER, sizeof(buf), buf, GL_STATIC_DRAW);
-
-    engine->buffer = b;
-    engine->shader = p;
-
-    return 0;
+static void on_adapter(WGPURequestAdapterStatus status, WGPUAdapter adapter,
+                       WGPUStringView msg, void *ud1, void *ud2) {
+  (void)ud2;
+  AppState *app = ud1;
+  if (status == WGPURequestAdapterStatus_Success)
+    app->adapter = adapter;
+  else
+    LOGE("request_adapter failed: %.*s", (int)msg.length, msg.data);
 }
 
-static void engine_draw_frame(struct engine* engine)
-{
-    if (engine->display == NULL)
-    {
-        return;
+static void on_device(WGPURequestDeviceStatus status, WGPUDevice device,
+                      WGPUStringView msg, void *ud1, void *ud2) {
+  (void)ud2;
+  AppState *app = ud1;
+  if (status == WGPURequestDeviceStatus_Success)
+    app->device = device;
+  else
+    LOGE("request_device failed: %.*s", (int)msg.length, msg.data);
+}
+
+static void on_wgpu_log(WGPULogLevel level, WGPUStringView msg, void *ud) {
+  (void)ud;
+  int prio = (level == WGPULogLevel_Error) ? ANDROID_LOG_ERROR : ANDROID_LOG_WARN;
+  __android_log_print(prio, TAG, "%.*s", (int)msg.length, msg.data);
+}
+
+// ─── init / teardown ───────────────────────────────────────────────────────
+
+static const char *SHADER_WGSL =
+  "@vertex\n"
+  "fn vs_main(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {\n"
+  "  var pos = array<vec2f, 3>(\n"
+  "    vec2f( 0.0,  0.5),\n"
+  "    vec2f(-0.5, -0.5),\n"
+  "    vec2f( 0.5, -0.5)\n"
+  "  );\n"
+  "  return vec4f(pos[vi], 0.0, 1.0);\n"
+  "}\n"
+  "@fragment\n"
+  "fn fs_main() -> @location(0) vec4f {\n"
+  "  return vec4f(1.0, 0.5, 0.0, 1.0);\n"
+  "}\n";
+
+static void wgpu_init(AppState *app) {
+  wgpuSetLogCallback(on_wgpu_log, NULL);
+  wgpuSetLogLevel(WGPULogLevel_Warn);
+
+  app->instance = wgpuCreateInstance(NULL);
+  assert(app->instance);
+
+  // surface from ANativeWindow
+  app->surface = wgpuInstanceCreateSurface(
+    app->instance,
+    &(WGPUSurfaceDescriptor){
+      .nextInChain = (WGPUChainedStruct *)&(WGPUSurfaceSourceAndroidNativeWindow){
+        .chain = { .sType = WGPUSType_SurfaceSourceAndroidNativeWindow },
+        .window = app->window,
+      },
     }
+  );
+  assert(app->surface);
 
-    glClearColor(0.258824f, 0.258824f, 0.435294f, 1);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+  wgpuInstanceRequestAdapter(
+    app->instance,
+    &(WGPURequestAdapterOptions){ .compatibleSurface = app->surface },
+    (WGPURequestAdapterCallbackInfo){ .callback = on_adapter, .userdata1 = app }
+  );
+  assert(app->adapter);
 
-    glUseProgram(engine->shader);
+  wgpuAdapterRequestDevice(
+    app->adapter, NULL,
+    (WGPURequestDeviceCallbackInfo){ .callback = on_device, .userdata1 = app }
+  );
+  assert(app->device);
 
-    glBindBuffer(GL_ARRAY_BUFFER, engine->buffer);
-    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, (2+3)*sizeof(float), NULL);
-    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, (2+3)*sizeof(float), (void*)(2*sizeof(float)));
-    glEnableVertexAttribArray(0);
-    glEnableVertexAttribArray(1);
+  app->queue = wgpuDeviceGetQueue(app->device);
+  assert(app->queue);
 
-    glDrawArrays(GL_TRIANGLES, 0, 3);
-
-    eglSwapBuffers(engine->display, engine->surface);
-}
-
-static void engine_term_display(struct engine* engine)
-{
-    if (engine->display != EGL_NO_DISPLAY)
-    {
-        glDeleteProgram(engine->shader);
-        glDeleteBuffers(1, &engine->buffer);
-
-        eglMakeCurrent(engine->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        if (engine->context != EGL_NO_CONTEXT)
-        {
-            eglDestroyContext(engine->display, engine->context);
-        }
-        if (engine->surface != EGL_NO_SURFACE)
-        {
-            eglDestroySurface(engine->display, engine->surface);
-        }
-        eglTerminate(engine->display);
+  // shader
+  WGPUShaderModule shader = wgpuDeviceCreateShaderModule(
+    app->device,
+    &(WGPUShaderModuleDescriptor){
+      .nextInChain = (WGPUChainedStruct *)&(WGPUShaderSourceWGSL){
+        .chain = { .sType = WGPUSType_ShaderSourceWGSL },
+        .code  = { SHADER_WGSL, WGPU_STRLEN },
+      },
     }
-    engine->active = 0;
-    engine->display = EGL_NO_DISPLAY;
-    engine->context = EGL_NO_CONTEXT;
-    engine->surface = EGL_NO_SURFACE;
-}
+  );
+  assert(shader);
 
-static int32_t engine_handle_input(struct android_app* app, AInputEvent* event)
-{
-    return 0;
-}
+  WGPUSurfaceCapabilities caps = {0};
+  wgpuSurfaceGetCapabilities(app->surface, app->adapter, &caps);
+  WGPUTextureFormat fmt = caps.formats[0];
 
-static void engine_handle_cmd(struct android_app* app, int32_t cmd)
-{
-    struct engine* engine = (struct engine*)app->userData;
-    switch (cmd)
-    {
-        case APP_CMD_INIT_WINDOW:
-        {
-            if (engine->app->window != NULL)
-            {
-                engine_init_display(engine);
-                engine_draw_frame(engine);
-            }
-        } break;
+  WGPUPipelineLayout layout = wgpuDeviceCreatePipelineLayout(
+    app->device,
+    &(WGPUPipelineLayoutDescriptor){ .label = {"pipeline_layout", WGPU_STRLEN} }
+  );
 
-        case APP_CMD_TERM_WINDOW:
-        {
-            engine_term_display(engine);
-        }
-        break;
-        
-        case APP_CMD_GAINED_FOCUS:
-        {
-            engine->active = 1;
-        }
-        break;
-
-        case APP_CMD_LOST_FOCUS:
-        {
-            engine->active = 0;
-            engine_draw_frame(engine);
-        }
-        break;
+  app->pipeline = wgpuDeviceCreateRenderPipeline(
+    app->device,
+    &(WGPURenderPipelineDescriptor){
+      .label  = {"triangle", WGPU_STRLEN},
+      .layout = layout,
+      .vertex = {
+        .module     = shader,
+        .entryPoint = {"vs_main", WGPU_STRLEN},
+      },
+      .fragment = &(WGPUFragmentState){
+        .module      = shader,
+        .entryPoint  = {"fs_main", WGPU_STRLEN},
+        .targetCount = 1,
+        .targets     = &(WGPUColorTargetState){
+          .format    = fmt,
+          .writeMask = WGPUColorWriteMask_All,
+        },
+      },
+      .primitive   = { .topology = WGPUPrimitiveTopology_TriangleList },
+      .multisample = { .count = 1, .mask = 0xFFFFFFFF },
     }
+  );
+  assert(app->pipeline);
+
+  int32_t w = ANativeWindow_getWidth(app->window);
+  int32_t h = ANativeWindow_getHeight(app->window);
+
+  app->config = (WGPUSurfaceConfiguration){
+    .device      = app->device,
+    .usage       = WGPUTextureUsage_RenderAttachment,
+    .format      = fmt,
+    .presentMode = WGPUPresentMode_Fifo,
+    .alphaMode   = caps.alphaModes[0],
+    .width       = (uint32_t)w,
+    .height      = (uint32_t)h,
+  };
+  wgpuSurfaceConfigure(app->surface, &app->config);
+
+  wgpuShaderModuleRelease(shader);
+  wgpuPipelineLayoutRelease(layout);
+  wgpuSurfaceCapabilitiesFreeMembers(caps);
+
+  LOGI("wgpu init complete (%dx%d)", w, h);
 }
 
-static int safe_top = 0;
-static int safe_bottom = 0;
-static int safe_left = 0;
-static int safe_right = 0;
+static void wgpu_frame(AppState *app) {
+  WGPUSurfaceTexture st;
+  wgpuSurfaceGetCurrentTexture(app->surface, &st);
+
+  switch (st.status) {
+    case WGPUSurfaceGetCurrentTextureStatus_SuccessOptimal:
+    case WGPUSurfaceGetCurrentTextureStatus_SuccessSuboptimal:
+      break;
+    case WGPUSurfaceGetCurrentTextureStatus_Timeout:
+    case WGPUSurfaceGetCurrentTextureStatus_Outdated:
+    case WGPUSurfaceGetCurrentTextureStatus_Lost:
+      if (st.texture) wgpuTextureRelease(st.texture);
+      wgpuSurfaceConfigure(app->surface, &app->config);
+      return;
+    default:
+      LOGE("fatal surface status %d", st.status);
+      abort();
+  }
+
+  WGPUTextureView frame = wgpuTextureCreateView(st.texture, NULL);
+
+  WGPUCommandEncoder enc = wgpuDeviceCreateCommandEncoder(
+    app->device,
+    &(WGPUCommandEncoderDescriptor){ .label = {"enc", WGPU_STRLEN} }
+  );
+
+  WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(
+    enc,
+    &(WGPURenderPassDescriptor){
+      .colorAttachmentCount = 1,
+      .colorAttachments = &(WGPURenderPassColorAttachment){
+        .view       = frame,
+        .loadOp     = WGPULoadOp_Clear,
+        .storeOp    = WGPUStoreOp_Store,
+        .depthSlice = WGPU_DEPTH_SLICE_UNDEFINED,
+        .clearValue = { .r=0.1, .g=0.1, .b=0.1, .a=1.0 },
+      },
+    }
+  );
+
+  wgpuRenderPassEncoderSetPipeline(rp, app->pipeline);
+  wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
+  wgpuRenderPassEncoderEnd(rp);
+  wgpuRenderPassEncoderRelease(rp);
+
+  WGPUCommandBuffer cmd = wgpuCommandEncoderFinish(
+    enc, &(WGPUCommandBufferDescriptor){ .label = {"cmd", WGPU_STRLEN} }
+  );
+  wgpuQueueSubmit(app->queue, 1, &cmd);
+  wgpuSurfacePresent(app->surface);
+
+  wgpuCommandBufferRelease(cmd);
+  wgpuCommandEncoderRelease(enc);
+  wgpuTextureViewRelease(frame);
+  wgpuTextureRelease(st.texture);
+}
+
+static void wgpu_destroy(AppState *app) {
+  wgpuRenderPipelineRelease(app->pipeline);
+  wgpuQueueRelease(app->queue);
+  wgpuDeviceRelease(app->device);
+  wgpuAdapterRelease(app->adapter);
+  wgpuSurfaceRelease(app->surface);
+  wgpuInstanceRelease(app->instance);
+}
+
+// ─── NativeActivity callbacks ───────────────────────────────────────────────
+
+static void on_window_init(ANativeActivity *activity, ANativeWindow *window) {
+  AppState *app  = activity->instance;
+  app->window    = window;
+  app->running   = true;
+  wgpu_init(app);
+}
+
+static void on_window_term(ANativeActivity *activity, ANativeWindow *window) {
+  (void)window;
+  AppState *app = activity->instance;
+  app->running  = false;
+  wgpu_destroy(app);
+  app->window = NULL;
+}
+
+static void on_destroy(ANativeActivity *activity) {
+  AppState *app = activity->instance;
+  free(app);
+}
+
+// main loop runs on the app thread via looper — simplest approach is to
+// spin in onWindowFocusChanged or pump from a dedicated thread; here we
+// just render one frame per input-queue flush by overriding onInputQueueCreated
+// to NULL and driving from the main thread via ANativeActivity_finish on idle.
+// For a proper game loop, spin a pthread here.
+static void on_idle(ANativeActivity *activity, ANativeWindow *window) {
+  (void)window;
+  AppState *app = activity->instance;
+  if (app->running && app->window)
+    wgpu_frame(app);
+}
 
 JNIEXPORT void JNICALL
-Java_com_example_NativeExample_MainActivity_nativeSetSafeArea(JNIEnv *env, jobject this,
-                                                             jint top, jint bottom, 
-                                                             jint left, jint right) {
-   safe_top = top;
-   safe_bottom = bottom;
-   safe_left = left;
-   safe_right = right;
-   
-   LOG("[SafeArea] Safe area: %d %d %d %d", top, bottom, left, right);
+Java_com_example_NativeExample_MainActivity_nativeSetSafeArea(
+    JNIEnv *env, jobject obj, jint top, jint bottom, jint left, jint right) {
+  (void)env; (void)obj;
+  LOGI("[SafeArea] Safe area: %d %d %d %d", top, bottom, left, right);
 }
 
-void java__vibrate(ANativeActivity *activity) {
-    JNIEnv *env = NULL;
-    JavaVM *vm = activity->vm;
-    
-    (*vm)->AttachCurrentThread(vm, &env, NULL);
-    
-    jclass clazz = (*env)->GetObjectClass(env, activity->clazz);
-    jmethodID methodID = (*env)->GetMethodID(env, clazz, "vibrate", "()V");
-    (*env)->CallVoidMethod(env, activity->clazz, methodID);
-    (*env)->DeleteLocalRef(env, clazz);
-    
-    (*vm)->DetachCurrentThread(vm);
-}
+void ANativeActivity_onCreate(ANativeActivity *activity,
+                               void *savedState, size_t savedStateSize) {
+  (void)savedState; (void)savedStateSize;
 
-void android_main(struct android_app* app)
-{
-    LOG("---\n");
+  AppState *app = calloc(1, sizeof(AppState));
+  app->activity = activity;
+  activity->instance = app;
 
-    struct engine engine;
-    memset(&engine, 0, sizeof(engine));
+  activity->callbacks->onNativeWindowCreated    = on_window_init;
+  activity->callbacks->onNativeWindowDestroyed  = on_window_term;
+  activity->callbacks->onDestroy                = on_destroy;
 
-    app->userData = &engine;
-    app->onAppCmd = engine_handle_cmd;
-    app->onInputEvent = engine_handle_input;
-    engine.app = app;
-
-    java__vibrate(app->activity);
-
-    while (1)
-    {
-        int ident;
-        int events;
-        struct android_poll_source* source;
-
-        while ((ident=ALooper_pollAll(engine.active ? 0 : -1, NULL, &events, (void**)&source)) >= 0)
-        {
-            if (source != NULL)
-            {
-                source->process(app, source);
-            }
-
-            if (app->destroyRequested != 0)
-            {
-                engine_term_display(&engine);
-                return;
-            }
-        }
-
-        if (engine.active)
-        {
-            engine_draw_frame(&engine);
-        }
-    }
+  // NativeActivity doesn't have an explicit idle hook; drive the render
+  // loop from onNativeWindowRedrawNeeded which fires on vsync/damage.
+  activity->callbacks->onNativeWindowRedrawNeeded = on_idle;
 }
