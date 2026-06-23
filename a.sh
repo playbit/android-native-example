@@ -44,55 +44,27 @@ get_package_activity() {
 build() {
   [ ! -d bin ] && mkdir bin
   mkdir -p bin/classes
-
+  
   "$ANDROID_NDK/ndk-build" -j4 NDK_LIBS_OUT=lib/lib || return 1
-
-  CLASSPATH="$ANDROID_SDK/platforms/$PLATFORM/android.jar$DEP_JARS"
 
   mkdir -p bin/classes/com/example/NativeExample
   mkdir -p bin/src/com/example/NativeExample
   cp jni/MainActivity.java bin/src/com/example/NativeExample/
+  "$JAVA_JDK/bin/javac" -d "bin/classes" -classpath "$ANDROID_SDK/platforms/$PLATFORM/android.jar" bin/src/com/example/NativeExample/MainActivity.java || return 1
+  "$ANDROID_SDK/build-tools/$BUILD_TOOLS/d8" --no-desugaring --output bin/ bin/classes/com/example/NativeExample/MainActivity.class || return 1
 
-  "$JAVA_JDK/bin/javac" \
-    -d "bin/classes" \
-    -classpath "$CLASSPATH" \
-    bin/src/com/example/NativeExample/MainActivity.java || return 1
-
-  D8_INPUTS="bin/classes/com/example/NativeExample/MainActivity.class"
-  for dep_dir in .deps/*/; do
-    [ -f "$dep_dir/classes.jar" ] && D8_INPUTS="$D8_INPUTS $dep_dir/classes.jar"
-  done
-
-  "$ANDROID_SDK/build-tools/$BUILD_TOOLS/d8" \
-    --min-api 26 \
-    --output bin/ \
-    $D8_INPUTS || return 1
-
-  "$ANDROID_SDK/build-tools/$BUILD_TOOLS/aapt" package \
-    -f \
-    -M AndroidManifest.xml \
-    -I "$ANDROID_SDK/platforms/$PLATFORM/android.jar" \
-    -A assets \
-    $DEP_RES_FLAGS \
-    -F bin/$APK.build \
-    bin lib || return 1
-
+  "$ANDROID_SDK/build-tools/$BUILD_TOOLS/aapt" package -f -M AndroidManifest.xml -I "$ANDROID_SDK/platforms/$PLATFORM/android.jar" -A assets -S res -F bin/$APK.build bin lib || return 1
+  
   if [ ! -f .keystore ]; then
-    "$JAVA_JDK/bin/keytool" -genkey -dname "CN=Android Debug, O=Android, C=US" \
-      -keystore .keystore -alias androiddebugkey \
-      -storepass android -keypass android \
-      -keyalg RSA -validity 30000 || return 1
+    "$JAVA_JDK/bin/keytool" -genkey -dname "CN=Android Debug, O=Android, C=US" -keystore .keystore -alias androiddebugkey -storepass android -keypass android -keyalg RSA -validity 30000 || return 1
   fi
-
-  "$JAVA_JDK/bin/jarsigner" \
-    -storepass android \
-    -keystore .keystore \
-    bin/$APK.build androiddebugkey > /dev/null || return 1
-
+  
+  "$JAVA_JDK/bin/jarsigner" -storepass android -keystore .keystore bin/$APK.build androiddebugkey > /dev/null || return 1
+  
   "$ANDROID_SDK/build-tools/$BUILD_TOOLS/zipalign" -f 4 bin/$APK.build bin/$APK || return 1
-
+  
   rm -f bin/$APK.build
-
+  
   return 0
 }
 
